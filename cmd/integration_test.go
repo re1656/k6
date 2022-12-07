@@ -1377,7 +1377,7 @@ func TestMinIterationDuration(t *testing.T) {
 		import { Counter } from 'k6/metrics';
 
 		export let options = {
-			minIterationDuration: '5s',
+			minIterationDuration: '7s',
 			setupTimeout: '2s',
 			teardownTimeout: '2s',
 			thresholds: {
@@ -1397,9 +1397,9 @@ func TestMinIterationDuration(t *testing.T) {
 	start := time.Now()
 	newRootCommand(ts.globalState).execute()
 	elapsed := time.Since(start)
-	assert.Greater(t, elapsed, 5*time.Second, "expected more time to have passed because of minIterationDuration")
+	assert.Greater(t, elapsed, 7*time.Second, "expected more time to have passed because of minIterationDuration")
 	assert.Less(
-		t, elapsed, 10*time.Second,
+		t, elapsed, 14*time.Second,
 		"expected less time to have passed because minIterationDuration should not affect setup() and teardown() ",
 	)
 
