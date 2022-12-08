@@ -84,7 +84,7 @@ func (r *Registry) newMetric(name string, mt MetricType, vt ...ValueType) *Metri
 	case Gauge:
 		sink = &GaugeSink{}
 	case Trend:
-		sink = &TrendSink{}
+		sink = NewTrendSink()
 	case Rate:
 		sink = &RateSink{}
 	default:

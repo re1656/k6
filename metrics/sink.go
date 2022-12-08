@@ -3,14 +3,15 @@ package metrics
 import (
 	"errors"
 	"math"
-	"sort"
 	"time"
+
+	"github.com/openhistogram/circonusllhist"
 )
 
 var (
 	_ Sink = &CounterSink{}
 	_ Sink = &GaugeSink{}
-	_ Sink = &TrendSink{}
+	_ Sink = NewTrendSink()
 	_ Sink = &RateSink{}
 	_ Sink = &DummySink{}
 )
@@ -67,63 +68,67 @@ func (g *GaugeSink) Format(t time.Duration) map[string]float64 {
 	return map[string]float64{"value": g.Value}
 }
 
-type TrendSink struct {
-	Values []float64
-	sorted bool
+// NewTrendSink makes a Trend sink with the OpenHistogram circllhist histogram.
+func NewTrendSink() *TrendSink {
+	return &TrendSink{
+		hist: circonusllhist.New(circonusllhist.NoLocks()),
+	}
+}
 
-	Count    uint64
-	Min, Max float64
-	Sum, Avg float64
+// TrendSink uses the OpenHistogram circllhist histogram to store metrics data.
+type TrendSink struct {
+	hist *circonusllhist.Histogram
+
+	// TODO: delete, this is hack so experimental-prometheus-rw can compile
+	Sum float64
+}
+
+func (t *TrendSink) nanToZero(val float64) float64 {
+	if math.IsNaN(val) {
+		return 0
+	}
+	return val
 }
 
 // IsEmpty indicates whether the TrendSink is empty.
-func (t *TrendSink) IsEmpty() bool { return t.Count == 0 }
+func (t *TrendSink) IsEmpty() bool { return t.hist.Count() == 0 }
 
 func (t *TrendSink) Add(s Sample) {
-	t.Values = append(t.Values, s.Value)
-	t.sorted = false
-	t.Count += 1
-	t.Sum += s.Value
-	t.Avg = t.Sum / float64(t.Count)
+	// TODO: handle the error, log something when there's an error
+	_ = t.hist.RecordValue(s.Value)
+}
 
-	if s.Value > t.Max {
-		t.Max = s.Value
-	}
-	if s.Value < t.Min || t.Count == 1 {
-		t.Min = s.Value
-	}
+// Min returns the approximate minimum value from the histogram.
+func (t *TrendSink) Min() float64 {
+	return t.nanToZero(t.hist.Min())
+}
+
+// Max returns the approximate maximum value from the histogram.
+func (t *TrendSink) Max() float64 {
+	return t.nanToZero(t.hist.Max())
+}
+
+// Count returns the number of recorded values.
+func (t *TrendSink) Count() uint64 {
+	return t.hist.Count()
+}
+
+// Avg returns the approximate average (i.e. mean) value from the histogram.
+func (t *TrendSink) Avg() float64 {
+	return t.nanToZero(t.hist.ApproxMean())
 }
 
 // P calculates the given percentile from sink values.
 func (t *TrendSink) P(pct float64) float64 {
-	switch t.Count {
-	case 0:
-		return 0
-	case 1:
-		return t.Values[0]
-	default:
-		if !t.sorted {
-			sort.Float64s(t.Values)
-			t.sorted = true
-		}
-
-		// If percentile falls on a value in Values slice, we return that value.
-		// If percentile does not fall on a value in Values slice, we calculate (linear interpolation)
-		// the value that would fall at percentile, given the values above and below that percentile.
-		i := pct * (float64(t.Count) - 1.0)
-		j := t.Values[int(math.Floor(i))]
-		k := t.Values[int(math.Ceil(i))]
-		f := i - math.Floor(i)
-		return j + (k-j)*f
-	}
+	return t.nanToZero(t.hist.ValueAtQuantile(pct))
 }
 
 func (t *TrendSink) Format(tt time.Duration) map[string]float64 {
 	// TODO: respect the summaryTrendStats for REST API
 	return map[string]float64{
-		"min":   t.Min,
-		"max":   t.Max,
-		"avg":   t.Avg,
+		"min":   t.Min(),
+		"max":   t.Max(),
+		"avg":   t.Avg(),
 		"med":   t.P(0.5),
 		"p(90)": t.P(0.90),
 		"p(95)": t.P(0.95),
