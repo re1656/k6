@@ -25,8 +25,8 @@ const thresholdsRate = 2 * time.Second
 // aggregated metric sample values. They are used to generate the end-of-test
 // summary and to evaluate the test thresholds.
 type MetricsEngine struct {
-	es     *lib.ExecutionState
-	logger logrus.FieldLogger
+	runState *lib.TestRunState
+	logger   logrus.FieldLogger
 
 	outputIngester *outputIngester
 
@@ -45,15 +45,15 @@ type MetricsEngine struct {
 }
 
 // NewMetricsEngine creates a new metrics Engine with the given parameters.
-func NewMetricsEngine(es *lib.ExecutionState) (*MetricsEngine, error) {
+func NewMetricsEngine(runState *lib.TestRunState, shouldProcessMetrics bool) (*MetricsEngine, error) {
 	me := &MetricsEngine{
-		es:     es,
-		logger: es.Test.Logger.WithField("component", "metrics-engine"),
+		runState: runState,
+		logger:   runState.Logger.WithField("component", "metrics-engine"),
 
 		ObservedMetrics: make(map[string]*metrics.Metric),
 	}
 
-	if !(me.es.Test.RuntimeOptions.NoSummary.Bool && me.es.Test.RuntimeOptions.NoThresholds.Bool) {
+	if shouldProcessMetrics {
 		err := me.initSubMetricsAndThresholds()
 		if err != nil {
 			return nil, err
@@ -73,11 +73,41 @@ func (me *MetricsEngine) CreateIngester() output.Output {
 	return me.outputIngester
 }
 
+// TODO: something better? deduplicate code with getThresholdMetricOrSubmetric
+func (me *MetricsEngine) ImportMetric(name string, data []byte) error {
+	me.MetricsLock.Lock()
+	defer me.MetricsLock.Unlock()
+
+	// TODO: replace with strings.Cut after Go 1.18
+	nameParts := strings.SplitN(name, "{", 2)
+
+	metric := me.runState.Registry.Get(nameParts[0])
+	if metric == nil {
+		return fmt.Errorf("metric '%s' does not exist in the script", nameParts[0])
+	}
+	if len(nameParts) == 1 { // no sub-metric
+		me.markObserved(metric)
+		return metric.Sink.Merge(data)
+	}
+
+	if nameParts[1][len(nameParts[1])-1] != '}' {
+		return fmt.Errorf("missing ending bracket, sub-metric format needs to be 'metric{key:value}'")
+	}
+
+	sm, err := metric.AddSubmetric(nameParts[1][:len(nameParts[1])-1])
+	if err != nil {
+		return err
+	}
+
+	me.markObserved(sm.Metric)
+	return sm.Metric.Sink.Merge(data)
+}
+
 func (me *MetricsEngine) getThresholdMetricOrSubmetric(name string) (*metrics.Metric, error) {
 	// TODO: replace with strings.Cut after Go 1.18
 	nameParts := strings.SplitN(name, "{", 2)
 
-	metric := me.es.Test.Registry.Get(nameParts[0])
+	metric := me.runState.Registry.Get(nameParts[0])
 	if metric == nil {
 		return nil, fmt.Errorf("metric '%s' does not exist in the script", nameParts[0])
 	}
@@ -126,10 +156,10 @@ func (me *MetricsEngine) markObserved(metric *metrics.Metric) {
 }
 
 func (me *MetricsEngine) initSubMetricsAndThresholds() error {
-	for metricName, thresholds := range me.es.Test.Options.Thresholds {
+	for metricName, thresholds := range me.runState.Options.Thresholds {
 		metric, err := me.getThresholdMetricOrSubmetric(metricName)
 
-		if me.es.Test.RuntimeOptions.NoThresholds.Bool {
+		if me.runState.RuntimeOptions.NoThresholds.Bool {
 			if err != nil {
 				me.logger.WithError(err).Warnf("Invalid metric '%s' in threshold definitions", metricName)
 			}
@@ -154,7 +184,7 @@ func (me *MetricsEngine) initSubMetricsAndThresholds() error {
 
 	// TODO: refactor out of here when https://github.com/grafana/k6/issues/1321
 	// lands and there is a better way to enable a metric with tag
-	if me.es.Test.Options.SystemTags.Has(metrics.TagExpectedResponse) {
+	if me.runState.Options.SystemTags.Has(metrics.TagExpectedResponse) {
 		_, err := me.getThresholdMetricOrSubmetric("http_req_duration{expected_response:true}")
 		if err != nil {
 			return err // shouldn't happen, but ¯\_(ツ)_/¯
@@ -166,9 +196,9 @@ func (me *MetricsEngine) initSubMetricsAndThresholds() error {
 
 // StartThresholdCalculations spins up a new goroutine to crunch thresholds and
 // returns a callback that will stop the goroutine and finalizes calculations.
-func (me *MetricsEngine) StartThresholdCalculations(abortRun func(error)) (
-	finalize func() (breached []string),
-) {
+func (me *MetricsEngine) StartThresholdCalculations(
+	getCurrentTestRunDuration func() time.Duration, abortRun func(error),
+) (finalize func() (breached []string)) {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 
@@ -180,7 +210,7 @@ func (me *MetricsEngine) StartThresholdCalculations(abortRun func(error)) (
 		for {
 			select {
 			case <-ticker.C:
-				breached, shouldAbort := me.evaluateThresholds(true)
+				breached, shouldAbort := me.evaluateThresholds(getCurrentTestRunDuration, true)
 				if shouldAbort {
 					err := fmt.Errorf(
 						"thresholds on metrics '%s' were breached; at least one has abortOnFail enabled, stopping test prematurely",
@@ -209,7 +239,7 @@ func (me *MetricsEngine) StartThresholdCalculations(abortRun func(error)) (
 		close(stop)
 		<-done
 
-		breached, _ := me.evaluateThresholds(false)
+		breached, _ := me.evaluateThresholds(getCurrentTestRunDuration, false)
 		return breached
 	}
 }
@@ -217,11 +247,13 @@ func (me *MetricsEngine) StartThresholdCalculations(abortRun func(error)) (
 // evaluateThresholds processes all of the thresholds.
 //
 // TODO: refactor, optimize
-func (me *MetricsEngine) evaluateThresholds(ignoreEmptySinks bool) (breachedThersholds []string, shouldAbort bool) {
+func (me *MetricsEngine) evaluateThresholds(
+	getCurrentTestRunDuration func() time.Duration, ignoreEmptySinks bool,
+) (breachedThersholds []string, shouldAbort bool) {
 	me.MetricsLock.Lock()
 	defer me.MetricsLock.Unlock()
 
-	t := me.es.GetCurrentTestRunDuration()
+	t := getCurrentTestRunDuration()
 
 	me.logger.Debugf("Running thresholds on %d metrics...", len(me.metricsWithThresholds))
 	for _, m := range me.metricsWithThresholds {

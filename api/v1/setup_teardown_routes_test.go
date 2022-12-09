@@ -16,6 +16,7 @@ import (
 	"gopkg.in/guregu/null.v3"
 
 	"go.k6.io/k6/execution"
+	"go.k6.io/k6/execution/local"
 	"go.k6.io/k6/js"
 	"go.k6.io/k6/lib"
 	"go.k6.io/k6/lib/types"
@@ -138,9 +139,9 @@ func TestSetupData(t *testing.T) {
 				TeardownTimeout: types.NullDurationFrom(5 * time.Second),
 			}, runner)
 
-			execScheduler, err := execution.NewScheduler(testState)
+			execScheduler, err := execution.NewScheduler(testState, local.NewController())
 			require.NoError(t, err)
-			metricsEngine, err := engine.NewMetricsEngine(execScheduler.GetState())
+			metricsEngine, err := engine.NewMetricsEngine(testState, true)
 			require.NoError(t, err)
 
 			globalCtx, globalCancel := context.WithCancel(context.Background())

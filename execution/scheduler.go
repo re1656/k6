@@ -20,6 +20,8 @@ import (
 // executors, running setup() and teardown(), and actually starting the
 // executors for the different scenarios at the appropriate times.
 type Scheduler struct {
+	controller Controller
+
 	initProgress    *pb.ProgressBar
 	executorConfigs []lib.ExecutorConfig // sorted by (startTime, ID)
 	executors       []lib.Executor       // sorted by (startTime, ID), excludes executors with no work
@@ -33,7 +35,7 @@ type Scheduler struct {
 // initializing it beyond the bare minimum. Specifically, it creates the needed
 // executor instances and a lot of state placeholders, but it doesn't initialize
 // the executors and it doesn't initialize or run VUs.
-func NewScheduler(trs *lib.TestRunState) (*Scheduler, error) {
+func NewScheduler(trs *lib.TestRunState, controller Controller) (*Scheduler, error) {
 	options := trs.Options
 	et, err := lib.NewExecutionTuple(options.ExecutionSegment, options.ExecutionSegmentSequence)
 	if err != nil {
@@ -81,6 +83,7 @@ func NewScheduler(trs *lib.TestRunState) (*Scheduler, error) {
 		maxDuration:     maxDuration,
 		maxPossibleVUs:  maxPossibleVUs,
 		state:           executionState,
+		controller:      controller,
 	}, nil
 }
 
@@ -372,11 +375,25 @@ func (e *Scheduler) runExecutor(
 	runResults <- err
 }
 
+func (e *Scheduler) signalAndWait(eventID string) error {
+	wait := e.controller.Wait(eventID)
+	err := e.controller.Signal(eventID)
+	if err != nil {
+		return err
+	}
+	return wait()
+}
+
 // Run the Scheduler, funneling all generated metric samples through the supplied
 // out channel.
 //
 //nolint:funlen
 func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- metrics.SampleContainer) error {
+	// TODO: use constants and namespaces for these
+	e.initProgress.Modify(pb.WithConstProgress(0, "Waiting to start..."))
+	e.signalAndWait("test-start")
+	defer e.signalAndWait("test-done")
+
 	execSchedRunCtx, execSchedRunCancel := context.WithCancel(runCtx)
 	waitForVUsMetricPush := e.emitVUsAndVUsMax(execSchedRunCtx, samplesOut)
 	defer waitForVUsMetricPush()
@@ -385,6 +402,8 @@ func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- met
 	if err := e.initVusAndExecutors(execSchedRunCtx, samplesOut); err != nil {
 		return err
 	}
+
+	e.signalAndWait("vus-initialized")
 
 	executorsCount := len(e.executors)
 	logger := e.state.Test.Logger.WithField("phase", "execution-scheduler-run")
@@ -409,6 +428,8 @@ func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- met
 		}
 	}
 
+	e.signalAndWait("test-ready-to-run-setup")
+
 	e.state.MarkStarted()
 	e.initProgress.Modify(pb.WithConstProgress(1, "running"))
 
@@ -425,11 +446,25 @@ func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- met
 	if !e.state.Test.Options.NoSetup.Bool {
 		e.state.SetExecutionStatus(lib.ExecutionStatusSetup)
 		e.initProgress.Modify(pb.WithConstProgress(1, "setup()"))
-		if err := e.state.Test.Runner.Setup(withExecStateCtx, samplesOut); err != nil {
-			logger.WithField("error", err).Debug("setup() aborted by error")
+		actuallyRanSetup := false
+		data, err := e.controller.GetOrCreateData("setup", func() ([]byte, error) {
+			actuallyRanSetup = true
+			if err := e.state.Test.Runner.Setup(withExecStateCtx, samplesOut); err != nil {
+				logger.WithField("error", err).Debug("setup() aborted by error")
+				return nil, err
+			}
+			return e.state.Test.Runner.GetSetupData(), nil
+		})
+		if err != nil {
 			return err
 		}
+		if !actuallyRanSetup {
+			e.state.Test.Runner.SetSetupData(data)
+		}
 	}
+
+	e.signalAndWait("setup-done")
+
 	e.initProgress.Modify(pb.WithHijack(e.getRunStats))
 
 	// Start all executors at their particular startTime in a separate goroutine...
@@ -453,6 +488,8 @@ func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- met
 		}
 	}
 
+	e.signalAndWait("execution-done")
+
 	// Run teardown() after all executors are done, if it's not disabled
 	if !e.state.Test.Options.NoTeardown.Bool {
 		e.state.SetExecutionStatus(lib.ExecutionStatusTeardown)
@@ -460,11 +497,21 @@ func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- met
 
 		// We run teardown() with the global context, so it isn't interrupted by
 		// thresholds or test.abort() or even Ctrl+C (unless used twice).
-		if err := e.state.Test.Runner.Teardown(globalCtx, samplesOut); err != nil {
-			logger.WithField("error", err).Debug("teardown() aborted by error")
+		// TODO: add a `sync.Once` equivalent?
+		_, err := e.controller.GetOrCreateData("teardown", func() ([]byte, error) {
+			if err := e.state.Test.Runner.Teardown(globalCtx, samplesOut); err != nil {
+				logger.WithField("error", err).Debug("teardown() aborted by error")
+				return nil, err
+			}
+			return nil, nil
+		})
+		if err != nil {
 			return err
 		}
 	}
+
+	e.signalAndWait("teardown-done")
+
 	if err := GetCancelReasonIfTestAborted(executorsRunCtx); err != nil {
 		interrupted = true
 		return err

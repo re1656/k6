@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.k6.io/k6/execution"
+	"go.k6.io/k6/execution/local"
 	"go.k6.io/k6/lib"
 	"go.k6.io/k6/lib/testutils"
 	"go.k6.io/k6/lib/testutils/minirunner"
@@ -43,10 +44,10 @@ func getTestRunState(tb testing.TB, options lib.Options, runner lib.Runner) *lib
 }
 
 func getControlSurface(tb testing.TB, testState *lib.TestRunState) *ControlSurface {
-	execScheduler, err := execution.NewScheduler(testState)
+	execScheduler, err := execution.NewScheduler(testState, local.NewController())
 	require.NoError(tb, err)
 
-	me, err := engine.NewMetricsEngine(execScheduler.GetState())
+	me, err := engine.NewMetricsEngine(testState, true)
 	require.NoError(tb, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
