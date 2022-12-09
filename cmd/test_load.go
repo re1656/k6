@@ -30,22 +30,35 @@ const (
 // loadedTest contains all of data, details and dependencies of a loaded
 // k6 test, but without any config consolidation.
 type loadedTest struct {
+	preInitState   *lib.TestPreInitState
 	sourceRootPath string // contains the raw string the user supplied
 	pwd            string
 	source         *loader.SourceData
 	fs             afero.Fs
 	fileSystems    map[string]afero.Fs
-	preInitState   *lib.TestPreInitState
 	initRunner     lib.Runner // TODO: rename to something more appropriate
 	keyLogger      io.Closer
 }
 
-func loadLocalTest(gs *globalState, cmd *cobra.Command, args []string) (*loadedTest, error) {
-	if len(args) < 1 {
-		return nil, fmt.Errorf("k6 needs at least one argument to load the test")
+func getPreInitState(gs *globalState, cmd *cobra.Command) (*lib.TestPreInitState, error) {
+	gs.logger.Debugf("Gathering k6 runtime options...")
+	runtimeOptions, err := getRuntimeOptions(cmd.Flags(), gs.envVars)
+	if err != nil {
+		return nil, err
 	}
 
-	sourceRootPath := args[0]
+	registry := metrics.NewRegistry()
+	return &lib.TestPreInitState{
+		Logger:         gs.logger,
+		RuntimeOptions: runtimeOptions,
+		Registry:       registry,
+		BuiltinMetrics: metrics.RegisterBuiltinMetrics(registry),
+	}, nil
+}
+
+func loadLocalTest(
+	gs *globalState, preInitState *lib.TestPreInitState, cmd *cobra.Command, sourceRootPath string,
+) (*loadedTest, error) {
 	gs.logger.Debugf("Resolving and reading test '%s'...", sourceRootPath)
 	src, fileSystems, pwd, err := readSource(gs, sourceRootPath)
 	if err != nil {
@@ -57,27 +70,13 @@ func loadLocalTest(gs *globalState, cmd *cobra.Command, args []string) (*loadedT
 		sourceRootPath, resolvedPath, len(src.Data),
 	)
 
-	gs.logger.Debugf("Gathering k6 runtime options...")
-	runtimeOptions, err := getRuntimeOptions(cmd.Flags(), gs.envVars)
-	if err != nil {
-		return nil, err
-	}
-
-	registry := metrics.NewRegistry()
-	state := &lib.TestPreInitState{
-		Logger:         gs.logger,
-		RuntimeOptions: runtimeOptions,
-		Registry:       registry,
-		BuiltinMetrics: metrics.RegisterBuiltinMetrics(registry),
-	}
-
 	test := &loadedTest{
+		preInitState:   preInitState,
 		pwd:            pwd,
 		sourceRootPath: sourceRootPath,
 		source:         src,
 		fs:             gs.fs,
 		fileSystems:    fileSystems,
-		preInitState:   state,
 	}
 
 	gs.logger.Debugf("Initializing k6 runner for '%s' (%s)...", sourceRootPath, resolvedPath)
@@ -230,11 +229,36 @@ type loadedAndConfiguredTest struct {
 	derivedConfig      Config
 }
 
-func loadAndConfigureLocalTest(
+func loadAndConfigureLocalTests(
 	gs *globalState, cmd *cobra.Command, args []string,
 	cliConfigGetter func(flags *pflag.FlagSet) (Config, error),
+) ([]*loadedAndConfiguredTest, error) {
+	if len(args) < 1 {
+		return nil, fmt.Errorf("k6 needs at least one argument to load the test")
+	}
+
+	preInitState, err := getPreInitState(gs, cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	tests := make([]*loadedAndConfiguredTest, 0, len(args))
+	for _, arg := range args {
+		test, err := loadAndConfigureLocalTest(gs, preInitState, cmd, arg, cliConfigGetter)
+		if err != nil {
+			return nil, err
+		}
+		tests = append(tests, test)
+	}
+
+	return tests, nil
+}
+
+func loadAndConfigureLocalTest(
+	gs *globalState, preInitState *lib.TestPreInitState, cmd *cobra.Command, sourceRootPath string,
+	cliConfigGetter func(flags *pflag.FlagSet) (Config, error),
 ) (*loadedAndConfiguredTest, error) {
-	test, err := loadLocalTest(gs, cmd, args)
+	test, err := loadLocalTest(gs, preInitState, cmd, sourceRootPath)
 	if err != nil {
 		return nil, err
 	}

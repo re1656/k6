@@ -17,6 +17,7 @@ func (c *Controller) Wait(eventId string) func() error {
 		return nil
 	}
 }
+
 func (c *Controller) Signal(eventId string) error {
 	return nil
 }

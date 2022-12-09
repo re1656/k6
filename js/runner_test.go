@@ -48,7 +48,6 @@ import (
 	"go.k6.io/k6/lib/testutils/mockoutput"
 	"go.k6.io/k6/lib/types"
 	"go.k6.io/k6/metrics"
-	"go.k6.io/k6/metrics/engine"
 	"go.k6.io/k6/output"
 )
 
@@ -388,21 +387,16 @@ func TestDataIsolation(t *testing.T) {
 	execScheduler, err := execution.NewScheduler(testRunState, local.NewController())
 	require.NoError(t, err)
 
-	metricsEngine, err := engine.NewMetricsEngine(testRunState, true)
-	require.NoError(t, err)
-
 	globalCtx, globalCancel := context.WithCancel(context.Background())
 	defer globalCancel()
 	runCtx, runAbort := execution.NewTestRunContext(globalCtx, testRunState.Logger)
 
 	mockOutput := mockoutput.New()
-	outputManager := output.NewManager([]output.Output{mockOutput, metricsEngine.CreateIngester()}, testRunState.Logger, runAbort)
+	outputManager := output.NewManager([]output.Output{mockOutput}, testRunState.Logger, runAbort)
 	samples := make(chan metrics.SampleContainer, 1000)
 	waitForMetricsFlushed, stopOutputs, err := outputManager.Start(samples)
 	require.NoError(t, err)
 	defer stopOutputs(nil)
-
-	finalizeThresholds := metricsEngine.StartThresholdCalculations(execScheduler.GetState().GetCurrentTestRunDuration, runAbort)
 
 	require.Empty(t, runner.defaultGroup.Groups)
 
@@ -417,8 +411,6 @@ func TestDataIsolation(t *testing.T) {
 		close(samples)
 		require.NoError(t, err)
 		waitForMetricsFlushed()
-		breached := finalizeThresholds()
-		require.Empty(t, breached)
 	}
 	require.Contains(t, runner.defaultGroup.Groups, "setup")
 	require.Contains(t, runner.defaultGroup.Groups, "teardown")

@@ -375,15 +375,6 @@ func (e *Scheduler) runExecutor(
 	runResults <- err
 }
 
-func (e *Scheduler) signalAndWait(eventID string) error {
-	wait := e.controller.Wait(eventID)
-	err := e.controller.Signal(eventID)
-	if err != nil {
-		return err
-	}
-	return wait()
-}
-
 // Run the Scheduler, funneling all generated metric samples through the supplied
 // out channel.
 //
@@ -391,8 +382,8 @@ func (e *Scheduler) signalAndWait(eventID string) error {
 func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- metrics.SampleContainer) error {
 	// TODO: use constants and namespaces for these
 	e.initProgress.Modify(pb.WithConstProgress(0, "Waiting to start..."))
-	e.signalAndWait("test-start")
-	defer e.signalAndWait("test-done")
+	SignalAndWait(e.controller, "scheduler-start")
+	defer SignalAndWait(e.controller, "scheduler-done")
 
 	execSchedRunCtx, execSchedRunCancel := context.WithCancel(runCtx)
 	waitForVUsMetricPush := e.emitVUsAndVUsMax(execSchedRunCtx, samplesOut)
@@ -403,7 +394,7 @@ func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- met
 		return err
 	}
 
-	e.signalAndWait("vus-initialized")
+	SignalAndWait(e.controller, "vus-initialized")
 
 	executorsCount := len(e.executors)
 	logger := e.state.Test.Logger.WithField("phase", "execution-scheduler-run")
@@ -428,7 +419,7 @@ func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- met
 		}
 	}
 
-	e.signalAndWait("test-ready-to-run-setup")
+	SignalAndWait(e.controller, "test-ready-to-run-setup")
 
 	e.state.MarkStarted()
 	e.initProgress.Modify(pb.WithConstProgress(1, "running"))
@@ -463,7 +454,7 @@ func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- met
 		}
 	}
 
-	e.signalAndWait("setup-done")
+	SignalAndWait(e.controller, "setup-done")
 
 	e.initProgress.Modify(pb.WithHijack(e.getRunStats))
 
@@ -488,7 +479,7 @@ func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- met
 		}
 	}
 
-	e.signalAndWait("execution-done")
+	SignalAndWait(e.controller, "execution-done")
 
 	// Run teardown() after all executors are done, if it's not disabled
 	if !e.state.Test.Options.NoTeardown.Bool {
@@ -510,7 +501,7 @@ func (e *Scheduler) Run(globalCtx, runCtx context.Context, samplesOut chan<- met
 		}
 	}
 
-	e.signalAndWait("teardown-done")
+	SignalAndWait(e.controller, "teardown-done")
 
 	if err := GetCancelReasonIfTestAborted(executorsRunCtx); err != nil {
 		interrupted = true

@@ -38,24 +38,46 @@ type cmdsRunAndAgent struct {
 	gs *globalState
 
 	// TODO: figure out something more elegant?
-	loadConfiguredTest func(cmd *cobra.Command, args []string) (*loadedAndConfiguredTest, execution.Controller, error)
-	metricsEngineHook  func(*engine.MetricsEngine) func()
-	testEndHook        func(err error)
+	loadConfiguredTests func(cmd *cobra.Command, args []string) ([]*loadedAndConfiguredTest, execution.Controller, error)
+	metricsEngineHook   func(*engine.MetricsEngine) func()
+	testEndHook         func(err error)
 }
 
-// TODO: split apart some more
-//
-//nolint:funlen,gocognit,gocyclo,cyclop
 func (c *cmdsRunAndAgent) run(cmd *cobra.Command, args []string) (err error) {
-	var logger logrus.FieldLogger = c.gs.logger
 	defer func() {
-		logger.Debugf("Everything has finished, exiting k6 with error '%s'!", err)
+		c.gs.logger.Debugf("Everything has finished, exiting k6 with error '%s'!", err)
 		if c.testEndHook != nil {
 			c.testEndHook(err)
 		}
 	}()
 	printBanner(c.gs)
 
+	// TODO: hadnle contexts, Ctrl+C, REST API and a lot of other things here
+
+	tests, controller, err := c.loadConfiguredTests(cmd, args)
+	if err != nil {
+		return err
+	}
+
+	execution.SignalAndWait(controller, "test-suite-start")
+	defer execution.SignalAndWait(controller, "test-suite-done")
+	for i, test := range tests {
+		testName := fmt.Sprintf("%d", i) // TODO: something better but still unique
+		testController := execution.GetNamespacedController(testName, controller)
+
+		err := c.runTest(cmd, test, testController)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+//nolint:funlen,gocognit,gocyclo,cyclop
+func (c *cmdsRunAndAgent) runTest(
+	cmd *cobra.Command, test *loadedAndConfiguredTest, controller execution.Controller,
+) (err error) {
+	var logger logrus.FieldLogger = c.gs.logger
 	globalCtx, globalCancel := context.WithCancel(c.gs.ctx)
 	defer globalCancel()
 
@@ -63,16 +85,14 @@ func (c *cmdsRunAndAgent) run(cmd *cobra.Command, args []string) (err error) {
 	// k6 was started with the --linger option.
 	lingerCtx, lingerCancel := context.WithCancel(globalCtx)
 	defer lingerCancel()
+	execution.SignalAndWait(controller, "test-start")
+	defer execution.SignalAndWait(controller, "test-done")
 
 	// runCtx is used for the test run execution and is created with the special
 	// execution.NewTestRunContext() function so that it can be aborted even
 	// from sub-contexts while also attaching a reason for the abort.
 	runCtx, runAbort := execution.NewTestRunContext(lingerCtx, logger)
 
-	test, controller, err := c.loadConfiguredTest(cmd, args)
-	if err != nil {
-		return err
-	}
 	if test.keyLogger != nil {
 		defer func() {
 			if klErr := test.keyLogger.Close(); klErr != nil {
@@ -122,19 +142,25 @@ func (c *cmdsRunAndAgent) run(cmd *cobra.Command, args []string) (err error) {
 		return err
 	}
 
-	// We'll need to pipe metrics to the MetricsEngine and process them if any
-	// of these are enabled: thresholds, end-of-test summary, engine hook
-	shouldProcessMetrics := (!testRunState.RuntimeOptions.NoSummary.Bool ||
-		!testRunState.RuntimeOptions.NoThresholds.Bool || c.metricsEngineHook != nil)
-	metricsEngine, err := engine.NewMetricsEngine(testRunState, shouldProcessMetrics)
+	metricsEngine, err := engine.NewMetricsEngine(testRunState.Registry, logger)
 	if err != nil {
 		return err
 	}
 
+	// We'll need to pipe metrics to the MetricsEngine and process them if any
+	// of these are enabled: thresholds, end-of-test summary, engine hook
+	shouldProcessMetrics := (!testRunState.RuntimeOptions.NoSummary.Bool ||
+		!testRunState.RuntimeOptions.NoThresholds.Bool || c.metricsEngineHook != nil)
+	var metricsIngester *engine.OutputIngester
 	if shouldProcessMetrics {
+		err = metricsEngine.InitSubMetricsAndThresholds(conf.Options, testRunState.RuntimeOptions.NoThresholds.Bool)
+		if err != nil {
+			return err
+		}
 		// We'll need to pipe metrics to the MetricsEngine if either the
 		// thresholds or the end-of-test summary are enabled.
-		outputs = append(outputs, metricsEngine.CreateIngester())
+		metricsIngester = metricsEngine.CreateIngester()
+		outputs = append(outputs, metricsIngester)
 	}
 
 	executionState := execScheduler.GetState()
@@ -192,7 +218,7 @@ func (c *cmdsRunAndAgent) run(cmd *cobra.Command, args []string) (err error) {
 
 	if !testRunState.RuntimeOptions.NoThresholds.Bool {
 		getCurrentTestDuration := executionState.GetCurrentTestRunDuration
-		finalizeThresholds := metricsEngine.StartThresholdCalculations(getCurrentTestDuration, runAbort)
+		finalizeThresholds := metricsEngine.StartThresholdCalculations(metricsIngester, getCurrentTestDuration, runAbort)
 		defer func() {
 			// This gets called after the Samples channel has been closed and
 			// the OutputManager has flushed all of the cached samples to
@@ -258,7 +284,7 @@ func (c *cmdsRunAndAgent) run(cmd *cobra.Command, args []string) (err error) {
 	}
 
 	printExecutionDescription(
-		c.gs, "local", args[0], "", conf, executionState.ExecutionTuple, executionPlan, outputs,
+		c.gs, "local", test.sourceRootPath, "", conf, executionState.ExecutionTuple, executionPlan, outputs,
 	)
 
 	// Trap Interrupts, SIGINTs and SIGTERMs.
@@ -347,9 +373,11 @@ func (c *cmdsRunAndAgent) flagSet() *pflag.FlagSet {
 func getCmdRun(gs *globalState) *cobra.Command {
 	c := &cmdsRunAndAgent{
 		gs: gs,
-		loadConfiguredTest: func(cmd *cobra.Command, args []string) (*loadedAndConfiguredTest, execution.Controller, error) {
-			test, err := loadAndConfigureLocalTest(gs, cmd, args, getConfig)
-			return test, local.NewController(), err
+		loadConfiguredTests: func(cmd *cobra.Command, args []string) (
+			[]*loadedAndConfiguredTest, execution.Controller, error,
+		) {
+			tests, err := loadAndConfigureLocalTests(gs, cmd, args, getConfig)
+			return tests, local.NewController(), err
 		},
 	}
 
@@ -378,7 +406,6 @@ a commandline interface for interacting with it.`,
 
   # Send metrics to an influxdb server
   k6 run -o influxdb=http://1.2.3.4:8086/k6`[1:],
-		Args: exactArgsWithMsg(1, "arg should either be \"-\", if reading script from stdin, or a path to a script file"),
 		RunE: c.run,
 	}
 

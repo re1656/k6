@@ -141,7 +141,7 @@ func TestSetupData(t *testing.T) {
 
 			execScheduler, err := execution.NewScheduler(testState, local.NewController())
 			require.NoError(t, err)
-			metricsEngine, err := engine.NewMetricsEngine(testState, true)
+			metricsEngine, err := engine.NewMetricsEngine(testState.Registry, testState.Logger)
 			require.NoError(t, err)
 
 			globalCtx, globalCancel := context.WithCancel(context.Background())
