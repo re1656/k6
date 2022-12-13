@@ -113,7 +113,7 @@ func getRuntimeOptions(flags *pflag.FlagSet, environment map[string]string) (lib
 		return opts, err
 	}
 	for _, kv := range envVars {
-		k, v := parseEnvKeyValue(kv)
+		k, v := lib.ParseEnvKeyValue(kv)
 		// Allow only alphanumeric ASCII variable names for now
 		if !userEnvVarName.MatchString(k) {
 			return opts, fmt.Errorf("invalid environment variable name '%s'", k)

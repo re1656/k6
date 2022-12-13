@@ -150,22 +150,6 @@ func getFlags(defaultFlags globalFlags, env map[string]string) globalFlags {
 	return result
 }
 
-func parseEnvKeyValue(kv string) (string, string) {
-	if idx := strings.IndexRune(kv, '='); idx != -1 {
-		return kv[:idx], kv[idx+1:]
-	}
-	return kv, ""
-}
-
-func buildEnvMap(environ []string) map[string]string {
-	env := make(map[string]string, len(environ))
-	for _, kv := range environ {
-		k, v := parseEnvKeyValue(kv)
-		env[k] = v
-	}
-	return env
-}
-
 // This is to keep all fields needed for the main/root k6 command
 type rootCommand struct {
 	globalState *globalState
