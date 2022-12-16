@@ -1,4 +1,4 @@
-package cmd
+package tests
 
 import (
 	"bytes"
@@ -22,6 +22,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 	"go.k6.io/k6/cloudapi"
+	"go.k6.io/k6/cmd"
+	"go.k6.io/k6/cmd/state"
 	"go.k6.io/k6/errext/exitcodes"
 	"go.k6.io/k6/lib"
 	"go.k6.io/k6/lib/consts"
@@ -29,45 +31,70 @@ import (
 	"go.k6.io/k6/lib/testutils/httpmultibin"
 )
 
+func TestDeprecatedOptionWarning(t *testing.T) {
+	t.Parallel()
+
+	ts := state.NewGlobalTestState(t)
+	ts.CmdArgs = []string{"k6", "--logformat", "json", "run", "-"}
+	ts.Console.Stdin = &state.TestOSFileR{Reader: bytes.NewBuffer([]byte(`
+		console.log('foo');
+		export default function() { console.log('bar'); };
+	`))}
+
+	cmd.Execute(ts.GlobalState)
+
+	logMsgs := ts.LoggerHook.Drain()
+	assert.True(t, testutils.LogContains(logMsgs, logrus.InfoLevel, "foo"))
+	assert.True(t, testutils.LogContains(logMsgs, logrus.InfoLevel, "bar"))
+	assert.Contains(t, ts.Stderr.String(), `"level":"info","msg":"foo","source":"console"`)
+	assert.Contains(t, ts.Stderr.String(), `"level":"info","msg":"bar","source":"console"`)
+
+	// TODO: after we get rid of cobra, actually emit this message to stderr
+	// and, ideally, through the log, not just print it...
+	assert.False(t, testutils.LogContains(logMsgs, logrus.InfoLevel, "logformat"))
+	assert.Contains(t, ts.Stdout.String(), `--logformat has been deprecated`)
+}
+
 func TestVersion(t *testing.T) {
 	t.Parallel()
 
-	ts := newGlobalTestState(t)
-	ts.args = []string{"k6", "version"}
-	newRootCommand(ts.globalState).execute()
+	ts := state.NewGlobalTestState(t)
+	ts.CmdArgs = []string{"k6", "version"}
+	cmd.Execute(ts.GlobalState)
 
-	stdOut := ts.stdOut.String()
-	assert.Contains(t, stdOut, "k6 v"+consts.Version)
-	assert.Contains(t, stdOut, runtime.Version())
-	assert.Contains(t, stdOut, runtime.GOOS)
-	assert.Contains(t, stdOut, runtime.GOARCH)
-	assert.Contains(t, stdOut, "k6/x/alarmist")
+	Stdout := ts.Stdout.String()
+	assert.Contains(t, Stdout, "k6 v"+consts.Version)
+	assert.Contains(t, Stdout, runtime.Version())
+	assert.Contains(t, Stdout, runtime.GOOS)
+	assert.Contains(t, Stdout, runtime.GOARCH)
+	assert.NotContains(t, Stdout[:len(Stdout)-1], "\n")
 
-	assert.Empty(t, ts.stdErr.Bytes())
-	assert.Empty(t, ts.loggerHook.Drain())
+	assert.Empty(t, ts.Stderr.Bytes())
+	assert.Empty(t, ts.LoggerHook.Drain())
 }
 
 func TestSimpleTestStdin(t *testing.T) {
 	t.Parallel()
 
-	ts := newGlobalTestState(t)
-	ts.args = []string{"k6", "run", "-"}
-	ts.console.Stdin = &testOSFileR{bytes.NewBufferString(`export default function() {};`)}
-	newRootCommand(ts.globalState).execute()
+	ts := state.NewGlobalTestState(t)
+	ts.CmdArgs = []string{"k6", "run", "-"}
+	ts.Console.Stdin = &state.TestOSFileR{Reader: bytes.NewBufferString(`export default function() {};`)}
+	cmd.Execute(ts.GlobalState)
 
-	stdOut := ts.stdOut.String()
-	assert.Contains(t, stdOut, "default: 1 iterations for each of 1 VUs")
-	assert.Contains(t, stdOut, "1 complete and 0 interrupted iterations")
-	assert.Empty(t, ts.stdErr.Bytes())
-	assert.Empty(t, ts.loggerHook.Drain())
+	Stdout := ts.Stdout.String()
+	assert.Contains(t, Stdout, "default: 1 iterations for each of 1 VUs")
+	assert.Contains(t, Stdout, "1 complete and 0 interrupted iterations")
+	assert.Empty(t, ts.Stderr.Bytes())
+	assert.Empty(t, ts.LoggerHook.Drain())
 }
 
+// TODO: Remove this? It doesn't test anything AFAICT...
 func TestStdoutAndStderrAreEmptyWithQuietAndHandleSummary(t *testing.T) {
 	t.Parallel()
 
-	ts := newGlobalTestState(t)
-	ts.args = []string{"k6", "--quiet", "run", "-"}
-	ts.console.Stdin = &testOSFileR{bytes.NewBufferString(`
+	ts := state.NewGlobalTestState(t)
+	ts.CmdArgs = []string{"k6", "--quiet", "run", "-"}
+	ts.Console.Stdin = &state.TestOSFileR{Reader: bytes.NewBufferString(`
 		export default function() {};
 		export function handleSummary(data) {
 			return {}; // silence the end of test summary
@@ -78,30 +105,30 @@ func TestStdoutAndStderrAreEmptyWithQuietAndHandleSummary(t *testing.T) {
 func TestStdoutAndStderrAreEmptyWithQuietAndLogsForwarded(t *testing.T) {
 	t.Parallel()
 
-	ts := newGlobalTestState(t)
+	ts := state.NewGlobalTestState(t)
 
 	// TODO: add a test with relative path
-	logFilePath := filepath.Join(ts.cwd, "test.log")
+	logFilePath := filepath.Join(ts.Cwd, "test.log")
 
-	ts.args = []string{
+	ts.CmdArgs = []string{
 		"k6", "--quiet", "--log-output", "file=" + logFilePath,
 		"--log-format", "raw", "run", "--no-summary", "-",
 	}
-	ts.console.Stdin = &testOSFileR{bytes.NewBufferString(`
+	ts.Console.Stdin = &state.TestOSFileR{Reader: bytes.NewBufferString(`
 		console.log('init');
 		export default function() { console.log('foo'); };
 	`)}
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
 	// The test state hook still catches this message
-	assert.True(t, testutils.LogContains(ts.loggerHook.Drain(), logrus.InfoLevel, `foo`))
+	assert.True(t, testutils.LogContains(ts.LoggerHook.Drain(), logrus.InfoLevel, `foo`))
 
 	// But it's not shown on stderr or stdout
-	assert.Empty(t, ts.stdErr.Bytes())
-	assert.Empty(t, ts.stdOut.Bytes())
+	assert.Empty(t, ts.Stderr.Bytes())
+	assert.Empty(t, ts.Stdout.Bytes())
 
 	// Instead it should be in the log file
-	logContents, err := afero.ReadFile(ts.fs, logFilePath)
+	logContents, err := afero.ReadFile(ts.FS, logFilePath)
 	require.NoError(t, err)
 	assert.Equal(t, "init\ninit\nfoo\n", string(logContents)) //nolint:dupword
 }
@@ -109,25 +136,25 @@ func TestStdoutAndStderrAreEmptyWithQuietAndLogsForwarded(t *testing.T) {
 func TestRelativeLogPathWithSetupAndTeardown(t *testing.T) {
 	t.Parallel()
 
-	ts := newGlobalTestState(t)
+	ts := state.NewGlobalTestState(t)
 
-	ts.args = []string{"k6", "--log-output", "file=test.log", "--log-format", "raw", "run", "-i", "2", "-"}
-	ts.console.Stdin = &testOSFileR{bytes.NewBufferString(`
+	ts.CmdArgs = []string{"k6", "--log-output", "file=test.log", "--log-format", "raw", "run", "-i", "2", "-"}
+	ts.Console.Stdin = &state.TestOSFileR{Reader: bytes.NewBufferString(`
 		console.log('init');
 		export default function() { console.log('foo'); };
 		export function setup() { console.log('bar'); };
 		export function teardown() { console.log('baz'); };
 	`)}
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
 	// The test state hook still catches these messages
-	logEntries := ts.loggerHook.Drain()
+	logEntries := ts.LoggerHook.Drain()
 	assert.True(t, testutils.LogContains(logEntries, logrus.InfoLevel, `foo`))
 	assert.True(t, testutils.LogContains(logEntries, logrus.InfoLevel, `bar`))
 	assert.True(t, testutils.LogContains(logEntries, logrus.InfoLevel, `baz`))
 
 	// And check that the log file also contains everything
-	logContents, err := afero.ReadFile(ts.fs, filepath.Join(ts.cwd, "test.log"))
+	logContents, err := afero.ReadFile(ts.FS, filepath.Join(ts.Cwd, "test.log"))
 	require.NoError(t, err)
 	assert.Equal(t, "init\ninit\ninit\nbar\nfoo\nfoo\ninit\nbaz\ninit\n", string(logContents)) //nolint:dupword
 }
@@ -135,31 +162,31 @@ func TestRelativeLogPathWithSetupAndTeardown(t *testing.T) {
 func TestWrongCliFlagIterations(t *testing.T) {
 	t.Parallel()
 
-	ts := newGlobalTestState(t)
-	ts.args = []string{"k6", "run", "--iterations", "foo", "-"}
-	ts.console.Stdin = &testOSFileR{bytes.NewBufferString(`export default function() {};`)}
+	ts := state.NewGlobalTestState(t)
+	ts.CmdArgs = []string{"k6", "run", "--iterations", "foo", "-"}
+	ts.Console.Stdin = &state.TestOSFileR{Reader: bytes.NewBufferString(`export default function() {};`)}
 	// TODO: check for exitcodes.InvalidConfig after https://github.com/loadimpact/k6/issues/883 is done...
-	ts.expectedExitCode = -1
-	newRootCommand(ts.globalState).execute()
-	assert.True(t, testutils.LogContains(ts.loggerHook.Drain(), logrus.ErrorLevel, `invalid argument "foo"`))
+	ts.ExpectedExitCode = -1
+	cmd.Execute(ts.GlobalState)
+	assert.True(t, testutils.LogContains(ts.LoggerHook.Drain(), logrus.ErrorLevel, `invalid argument "foo"`))
 }
 
 func TestWrongEnvVarIterations(t *testing.T) {
 	t.Parallel()
 
-	ts := newGlobalTestState(t)
-	ts.args = []string{"k6", "run", "--vus", "2", "-"}
-	ts.envVars["K6_ITERATIONS"] = "4"
-	ts.console.Stdin = &testOSFileR{bytes.NewBufferString(`export default function() {};`)}
+	ts := state.NewGlobalTestState(t)
+	ts.CmdArgs = []string{"k6", "run", "--vus", "2", "-"}
+	ts.Env["K6_ITERATIONS"] = "4"
+	ts.Console.Stdin = &state.TestOSFileR{Reader: bytes.NewBufferString(`export default function() {};`)}
 
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, "4 iterations shared among 2 VUs")
-	assert.Contains(t, stdOut, "4 complete and 0 interrupted iterations")
-	assert.Empty(t, ts.stdErr.Bytes())
-	assert.Empty(t, ts.loggerHook.Drain())
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, "4 iterations shared among 2 VUs")
+	assert.Contains(t, Stdout, "4 complete and 0 interrupted iterations")
+	assert.Empty(t, ts.Stderr.Bytes())
+	assert.Empty(t, ts.LoggerHook.Drain())
 }
 
 func TestMetricsAndThresholds(t *testing.T) {
@@ -222,27 +249,27 @@ func TestMetricsAndThresholds(t *testing.T) {
 			return { stdout: JSON.stringify(data, null, 4) }
 		}
 	`
-	ts := newGlobalTestState(t)
-	require.NoError(t, afero.WriteFile(ts.fs, filepath.Join(ts.cwd, "test.js"), []byte(script), 0o644))
-	ts.args = []string{"k6", "run", "--quiet", "--log-format=raw", "test.js"}
+	ts := state.NewGlobalTestState(t)
+	require.NoError(t, afero.WriteFile(ts.FS, filepath.Join(ts.Cwd, "test.js"), []byte(script), 0o644))
+	ts.CmdArgs = []string{"k6", "run", "--quiet", "--log-format=raw", "test.js"}
 
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
 	expLogLines := []string{
 		`setup() start`, `setup() end`, `default({"foo":"bar"})`,
 		`default({"foo":"bar"})`, `teardown({"foo":"bar"})`, `handleSummary()`,
 	}
 
-	logHookEntries := ts.loggerHook.Drain()
+	logHookEntries := ts.LoggerHook.Drain()
 	require.Len(t, logHookEntries, len(expLogLines))
 	for i, expLogLine := range expLogLines {
 		assert.Equal(t, expLogLine, logHookEntries[i].Message)
 	}
 
-	assert.Equal(t, strings.Join(expLogLines, "\n")+"\n", ts.stdErr.String())
+	assert.Equal(t, strings.Join(expLogLines, "\n")+"\n", ts.Stderr.String())
 
 	var summary map[string]interface{}
-	require.NoError(t, json.Unmarshal(ts.stdOut.Bytes(), &summary))
+	require.NoError(t, json.Unmarshal(ts.Stdout.Bytes(), &summary))
 
 	metrics, ok := summary["metrics"].(map[string]interface{})
 	require.True(t, ok)
@@ -259,24 +286,24 @@ func TestMetricsAndThresholds(t *testing.T) {
 
 func TestSSLKEYLOGFILEAbsolute(t *testing.T) {
 	t.Parallel()
-	ts := newGlobalTestState(t)
-	testSSLKEYLOGFILE(t, ts, filepath.Join(ts.cwd, "ssl.log"))
+	ts := state.NewGlobalTestState(t)
+	testSSLKEYLOGFILE(t, ts, filepath.Join(ts.Cwd, "ssl.log"))
 }
 
 func TestSSLKEYLOGFILEARelative(t *testing.T) {
 	t.Parallel()
-	ts := newGlobalTestState(t)
+	ts := state.NewGlobalTestState(t)
 	testSSLKEYLOGFILE(t, ts, "./ssl.log")
 }
 
-func testSSLKEYLOGFILE(t *testing.T, ts *globalTestState, filePath string) {
+func testSSLKEYLOGFILE(t *testing.T, ts *state.GlobalTestState, filePath string) {
 	t.Helper()
 
 	// TODO don't use insecureSkipTLSVerify when/if tlsConfig is given to the runner from outside
 	tb := httpmultibin.NewHTTPMultiBin(t)
-	ts.args = []string{"k6", "run", "-"}
-	ts.envVars["SSLKEYLOGFILE"] = filePath
-	ts.console.Stdin = &testOSFileR{bytes.NewReader([]byte(tb.Replacer.Replace(`
+	ts.CmdArgs = []string{"k6", "run", "-"}
+	ts.Env["SSLKEYLOGFILE"] = filePath
+	ts.Console.Stdin = &state.TestOSFileR{Reader: bytes.NewReader([]byte(tb.Replacer.Replace(`
     import http from "k6/http"
     export const options = {
       hosts: {
@@ -290,11 +317,11 @@ func testSSLKEYLOGFILE(t *testing.T, ts *globalTestState, filePath string) {
     }
   `)))}
 
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
 	assert.True(t,
-		testutils.LogContains(ts.loggerHook.Drain(), logrus.WarnLevel, "SSLKEYLOGFILE was specified"))
-	sslloglines, err := afero.ReadFile(ts.fs, filepath.Join(ts.cwd, "ssl.log"))
+		testutils.LogContains(ts.LoggerHook.Drain(), logrus.WarnLevel, "SSLKEYLOGFILE was specified"))
+	sslloglines, err := afero.ReadFile(ts.FS, filepath.Join(ts.Cwd, "ssl.log"))
 	require.NoError(t, err)
 	// TODO maybe have multiple depending on the ciphers used as that seems to change it
 	assert.Regexp(t, "^CLIENT_[A-Z_]+ [0-9a-f]+ [0-9a-f]+\n", string(sslloglines))
@@ -303,9 +330,9 @@ func testSSLKEYLOGFILE(t *testing.T, ts *globalTestState, filePath string) {
 func TestThresholdDeprecationWarnings(t *testing.T) {
 	t.Parallel()
 
-	ts := newGlobalTestState(t)
-	ts.args = []string{"k6", "run", "--system-tags", "url,error,vu,iter,scenario", "-"}
-	ts.console.Stdin = &testOSFileR{bytes.NewReader([]byte(`
+	ts := state.NewGlobalTestState(t)
+	ts.CmdArgs = []string{"k6", "run", "--system-tags", "url,error,vu,iter,scenario", "-"}
+	ts.Console.Stdin = &state.TestOSFileR{Reader: bytes.NewReader([]byte(`
 		export const options = {
 			thresholds: {
 				'http_req_duration{url:https://test.k6.io}': ['p(95)<500', 'p(99)<1000'],
@@ -318,9 +345,9 @@ func TestThresholdDeprecationWarnings(t *testing.T) {
 		export default function () { }`,
 	))}
 
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	logs := ts.loggerHook.Drain()
+	logs := ts.LoggerHook.Drain()
 
 	// We no longer warn about this
 	assert.False(t, testutils.LogContains(logs, logrus.WarnLevel, "http_req_duration{url:https://test.k6.io}"))
@@ -350,13 +377,13 @@ func TestExecutionTestOptionsDefaultValues(t *testing.T) {
 		}
 	`
 
-	ts := newGlobalTestState(t)
-	require.NoError(t, afero.WriteFile(ts.fs, filepath.Join(ts.cwd, "test.js"), []byte(script), 0o644))
-	ts.args = []string{"k6", "run", "--iterations", "1", "test.js"}
+	ts := state.NewGlobalTestState(t)
+	require.NoError(t, afero.WriteFile(ts.FS, filepath.Join(ts.Cwd, "test.js"), []byte(script), 0o644))
+	ts.CmdArgs = []string{"k6", "run", "--iterations", "1", "test.js"}
 
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	loglines := ts.loggerHook.Drain()
+	loglines := ts.LoggerHook.Drain()
 	require.Len(t, loglines, 1)
 
 	expected := `{"paused":null,"executionSegment":null,"executionSegmentSequence":null,"noSetup":null,"setupTimeout":null,"noTeardown":null,"teardownTimeout":null,"rps":null,"dns":{"ttl":null,"select":null,"policy":null},"maxRedirects":null,"userAgent":null,"batch":null,"batchPerHost":null,"httpDebug":null,"insecureSkipTLSVerify":null,"tlsCipherSuites":null,"tlsVersion":null,"tlsAuth":null,"throw":null,"thresholds":null,"blacklistIPs":null,"blockHostnames":null,"hosts":null,"noConnectionReuse":null,"noVUConnectionReuse":null,"minIterationDuration":null,"ext":null,"summaryTrendStats":["avg", "min", "med", "max", "p(90)", "p(95)"],"summaryTimeUnit":null,"systemTags":["check","error","error_code","expected_response","group","method","name","proto","scenario","service","status","subproto","tls_version","url"],"tags":null,"metricSamplesBufferSize":null,"noCookiesReset":null,"discardResponseBodies":null,"consoleOutput":null,"scenarios":{"default":{"vus":null,"iterations":1,"executor":"shared-iterations","maxDuration":null,"startTime":null,"env":null,"tags":null,"gracefulStop":null,"exec":null}},"localIPs":null}`
@@ -381,14 +408,14 @@ func TestSubMetricThresholdNoData(t *testing.T) {
 			counter2.add(42);
 		}
 	`
-	ts := newGlobalTestState(t)
-	require.NoError(t, afero.WriteFile(ts.fs, filepath.Join(ts.cwd, "test.js"), []byte(script), 0o644))
-	ts.args = []string{"k6", "run", "--quiet", "test.js"}
+	ts := state.NewGlobalTestState(t)
+	require.NoError(t, afero.WriteFile(ts.FS, filepath.Join(ts.Cwd, "test.js"), []byte(script), 0o644))
+	ts.CmdArgs = []string{"k6", "run", "--quiet", "test.js"}
 
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	assert.Len(t, ts.loggerHook.Drain(), 0)
-	assert.Contains(t, ts.stdOut.String(), `
+	assert.Len(t, ts.LoggerHook.Drain(), 0)
+	assert.Contains(t, ts.Stdout.String(), `
      one..................: 0   0/s
        { tag:xyz }........: 0   0/s
      two..................: 42`)
@@ -459,18 +486,18 @@ func getCloudTestEndChecker(t *testing.T, expRunStatus lib.RunStatus, expResultS
 func getSimpleCloudOutputTestState(
 	t *testing.T, script []byte, cliFlags []string,
 	expRunStatus lib.RunStatus, expResultStatus cloudapi.ResultStatus, expExitCode int,
-) *globalTestState {
+) *state.GlobalTestState {
 	srv := getCloudTestEndChecker(t, expRunStatus, expResultStatus)
 
 	if cliFlags == nil {
 		cliFlags = []string{"-v", "--log-output=stdout"}
 	}
 
-	ts := newGlobalTestState(t)
-	require.NoError(t, afero.WriteFile(ts.fs, filepath.Join(ts.cwd, "test.js"), script, 0o644))
-	ts.envVars["K6_CLOUD_HOST"] = srv.URL
-	ts.args = append([]string{"k6", "run", "--out", "cloud", "test.js"}, cliFlags...)
-	ts.expectedExitCode = expExitCode
+	ts := state.NewGlobalTestState(t)
+	require.NoError(t, afero.WriteFile(ts.FS, filepath.Join(ts.Cwd, "test.js"), script, 0o644))
+	ts.Env["K6_CLOUD_HOST"] = srv.URL
+	ts.CmdArgs = append([]string{"k6", "run", "--out", "cloud", "test.js"}, cliFlags...)
+	ts.ExpectedExitCode = expExitCode
 
 	return ts
 }
@@ -510,14 +537,14 @@ func TestSetupTeardownThresholds(t *testing.T) {
 	`))
 
 	ts := getSimpleCloudOutputTestState(t, script, nil, lib.RunStatusFinished, cloudapi.ResultStatusPassed, 0)
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	stdOut := ts.stdOut.String()
-	assert.Contains(t, stdOut, `✓ http_reqs......................: 7`)
-	assert.Contains(t, stdOut, `✓ iterations.....................: 5`)
-	assert.Contains(t, stdOut, `✓ setup_teardown.................: 2`)
+	Stdout := ts.Stdout.String()
+	assert.Contains(t, Stdout, `✓ http_reqs......................: 7`)
+	assert.Contains(t, Stdout, `✓ iterations.....................: 5`)
+	assert.Contains(t, Stdout, `✓ setup_teardown.................: 2`)
 
-	logMsgs := ts.loggerHook.Drain()
+	logMsgs := ts.LoggerHook.Drain()
 	for _, msg := range logMsgs {
 		if msg.Level != logrus.DebugLevel {
 			assert.Failf(t, "unexpected log message", "level %s, msg '%s'", msg.Level, msg.Message)
@@ -557,15 +584,15 @@ func TestThresholdsFailed(t *testing.T) {
 	ts := getSimpleCloudOutputTestState(
 		t, script, nil, lib.RunStatusFinished, cloudapi.ResultStatusFailed, int(exitcodes.ThresholdsHaveFailed),
 	)
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	assert.True(t, testutils.LogContains(ts.loggerHook.Drain(), logrus.ErrorLevel, `some thresholds have failed`))
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, `   ✓ iterations...........: 3`)
-	assert.Contains(t, stdOut, `     ✗ { scenario:sc1 }...: 1`)
-	assert.Contains(t, stdOut, `     ✗ { scenario:sc2 }...: 2`)
-	assert.Contains(t, stdOut, `     ✓ { scenario:sc3 }...: 0   0/s`)
+	assert.True(t, testutils.LogContains(ts.LoggerHook.Drain(), logrus.ErrorLevel, `some thresholds have failed`))
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, `   ✓ iterations...........: 3`)
+	assert.Contains(t, Stdout, `     ✗ { scenario:sc1 }...: 1`)
+	assert.Contains(t, Stdout, `     ✗ { scenario:sc2 }...: 2`)
+	assert.Contains(t, Stdout, `     ✓ { scenario:sc3 }...: 0   0/s`)
 }
 
 func TestAbortedByThreshold(t *testing.T) {
@@ -598,16 +625,16 @@ func TestAbortedByThreshold(t *testing.T) {
 	ts := getSimpleCloudOutputTestState(
 		t, script, nil, lib.RunStatusAbortedThreshold, cloudapi.ResultStatusFailed, int(exitcodes.ThresholdsHaveFailed),
 	)
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	assert.True(t, testutils.LogContains(ts.loggerHook.Drain(), logrus.ErrorLevel, `some thresholds have failed`))
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, `✗ iterations`)
-	assert.Contains(t, stdOut, `teardown() called`)
-	assert.Contains(t, stdOut, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
-	assert.Contains(t, stdOut, `level=debug msg="Metrics processing finished!"`)
-	assert.Contains(t, stdOut, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=8 tainted=true`)
+	assert.True(t, testutils.LogContains(ts.LoggerHook.Drain(), logrus.ErrorLevel, `some thresholds have failed`))
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, `✗ iterations`)
+	assert.Contains(t, Stdout, `teardown() called`)
+	assert.Contains(t, Stdout, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
+	assert.Contains(t, Stdout, `level=debug msg="Metrics processing finished!"`)
+	assert.Contains(t, Stdout, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=8 tainted=true`)
 }
 
 func TestAbortedByUserWithGoodThresholds(t *testing.T) {
@@ -641,27 +668,27 @@ func TestAbortedByUserWithGoodThresholds(t *testing.T) {
 	`)
 
 	ts := getSimpleCloudOutputTestState(t, script, nil, lib.RunStatusAbortedUser, cloudapi.ResultStatusPassed, 0)
-	ts.globalState.signalNotify = func(c chan<- os.Signal, s ...os.Signal) {
+	ts.GlobalState.SignalNotify = func(c chan<- os.Signal, s ...os.Signal) {
 		go func() {
 			// simulate a Ctrl+C after 3 seconds
 			time.Sleep(3 * time.Second)
 			c <- os.Interrupt
 		}()
 	}
-	ts.globalState.signalStop = func(c chan<- os.Signal) { /* noop */ }
+	ts.GlobalState.SignalStop = func(c chan<- os.Signal) { /* noop */ }
 
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	assert.False(t, testutils.LogContains(ts.loggerHook.Drain(), logrus.ErrorLevel, `some thresholds have failed`))
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, `✓ iterations`)
-	assert.Contains(t, stdOut, `✓ tc`)
-	assert.Contains(t, stdOut, `✓ { group:::teardown }`)
-	assert.Contains(t, stdOut, `Stopping k6 in response to signal`)
-	assert.Contains(t, stdOut, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
-	assert.Contains(t, stdOut, `level=debug msg="Metrics processing finished!"`)
-	assert.Contains(t, stdOut, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=5 tainted=false`)
+	assert.False(t, testutils.LogContains(ts.LoggerHook.Drain(), logrus.ErrorLevel, `some thresholds have failed`))
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, `✓ iterations`)
+	assert.Contains(t, Stdout, `✓ tc`)
+	assert.Contains(t, Stdout, `✓ { group:::teardown }`)
+	assert.Contains(t, Stdout, `Stopping k6 in response to signal`)
+	assert.Contains(t, Stdout, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
+	assert.Contains(t, Stdout, `level=debug msg="Metrics processing finished!"`)
+	assert.Contains(t, Stdout, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=5 tainted=false`)
 }
 
 func TestAbortedByUserWithRestAPI(t *testing.T) {
@@ -688,22 +715,22 @@ func TestAbortedByUserWithRestAPI(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		newRootCommand(ts.globalState).execute()
+		cmd.Execute(ts.GlobalState)
 	}()
 
 	reachedIteration := false
 	for i := 0; i <= 10 && reachedIteration == false; i++ {
 		time.Sleep(1 * time.Second)
-		stdOut := ts.stdOut.String()
+		Stdout := ts.Stdout.String()
 
-		if !strings.Contains(stdOut, "a simple iteration") {
+		if !strings.Contains(Stdout, "a simple iteration") {
 			t.Logf("did not see an iteration on try %d at t=%s", i, time.Now())
 			continue
 		}
 
 		reachedIteration = true
 		req, err := http.NewRequestWithContext(
-			ts.ctx, http.MethodPatch, fmt.Sprintf("http://%s/v1/status", ts.flags.address),
+			ts.Ctx, http.MethodPatch, fmt.Sprintf("http://%s/v1/status", ts.Flags.Address),
 			bytes.NewBufferString(`{"data":{"type":"status","id":"default","attributes":{"stopped":true}}}`),
 		)
 		require.NoError(t, err)
@@ -719,15 +746,15 @@ func TestAbortedByUserWithRestAPI(t *testing.T) {
 	assert.True(t, reachedIteration)
 
 	wg.Wait()
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, `a simple iteration`)
-	assert.Contains(t, stdOut, `teardown() called`)
-	assert.Contains(t, stdOut, `PATCH /v1/status`)
-	assert.Contains(t, stdOut, `run: stopped by user; exiting...`)
-	assert.Contains(t, stdOut, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
-	assert.Contains(t, stdOut, `level=debug msg="Metrics processing finished!"`)
-	assert.Contains(t, stdOut, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=5 tainted=false`)
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, `a simple iteration`)
+	assert.Contains(t, Stdout, `teardown() called`)
+	assert.Contains(t, Stdout, `PATCH /v1/status`)
+	assert.Contains(t, Stdout, `run: stopped by user; exiting...`)
+	assert.Contains(t, Stdout, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
+	assert.Contains(t, Stdout, `level=debug msg="Metrics processing finished!"`)
+	assert.Contains(t, Stdout, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=5 tainted=false`)
 }
 
 func TestAbortedByScriptSetupErrorWithDependency(t *testing.T) {
@@ -754,59 +781,59 @@ func TestAbortedByScriptSetupErrorWithDependency(t *testing.T) {
 
 	srv := getCloudTestEndChecker(t, lib.RunStatusAbortedScriptError, cloudapi.ResultStatusPassed)
 
-	ts := newGlobalTestState(t)
-	require.NoError(t, afero.WriteFile(ts.fs, filepath.Join(ts.cwd, "test.js"), mainScript, 0o644))
-	require.NoError(t, afero.WriteFile(ts.fs, filepath.Join(ts.cwd, "bar.js"), depScript, 0o644))
+	ts := state.NewGlobalTestState(t)
+	require.NoError(t, afero.WriteFile(ts.FS, filepath.Join(ts.Cwd, "test.js"), mainScript, 0o644))
+	require.NoError(t, afero.WriteFile(ts.FS, filepath.Join(ts.Cwd, "bar.js"), depScript, 0o644))
 
-	ts.envVars["K6_CLOUD_HOST"] = srv.URL
-	ts.args = []string{"k6", "run", "-v", "--out", "cloud", "--log-output=stdout", "test.js"}
-	ts.expectedExitCode = int(exitcodes.ScriptException)
+	ts.Env["K6_CLOUD_HOST"] = srv.URL
+	ts.CmdArgs = []string{"k6", "run", "-v", "--out", "cloud", "--log-output=stdout", "test.js"}
+	ts.ExpectedExitCode = int(exitcodes.ScriptException)
 
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, `wonky setup`)
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, `wonky setup`)
 
 	rootPath := "file:///"
 	if runtime.GOOS == "windows" {
 		rootPath += "c:/"
 	}
-	assert.Contains(t, stdOut, `level=error msg="Error: baz\n\tat baz (`+rootPath+`test/bar.js:6:9(3))\n\tat `+
+	assert.Contains(t, Stdout, `level=error msg="Error: baz\n\tat baz (`+rootPath+`test/bar.js:6:9(3))\n\tat `+
 		rootPath+`test/bar.js:3:3(3)\n\tat setup (`+rootPath+`test/test.js:5:3(9))\n\tat native\n" hint="script exception"`)
-	assert.Contains(t, stdOut, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=7 tainted=false`)
-	assert.Contains(t, stdOut, "bogus summary")
+	assert.Contains(t, Stdout, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=7 tainted=false`)
+	assert.Contains(t, Stdout, "bogus summary")
 }
 
-func runTestWithNoLinger(t *testing.T, ts *globalTestState) {
-	newRootCommand(ts.globalState).execute()
+func runTestWithNoLinger(t *testing.T, ts *state.GlobalTestState) {
+	cmd.Execute(ts.GlobalState)
 }
 
-func runTestWithLinger(t *testing.T, ts *globalTestState) {
-	ts.args = append(ts.args, "--linger")
+func runTestWithLinger(t *testing.T, ts *state.GlobalTestState) {
+	ts.CmdArgs = append(ts.CmdArgs, "--linger")
 
 	sendSignal := make(chan struct{})
-	ts.globalState.signalNotify = func(c chan<- os.Signal, s ...os.Signal) {
+	ts.GlobalState.SignalNotify = func(c chan<- os.Signal, s ...os.Signal) {
 		go func() {
 			<-sendSignal
 			c <- os.Interrupt
 		}()
 	}
-	ts.globalState.signalStop = func(c chan<- os.Signal) { /* noop */ }
+	ts.GlobalState.SignalStop = func(c chan<- os.Signal) { /* noop */ }
 
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		newRootCommand(ts.globalState).execute()
+		cmd.Execute(ts.GlobalState)
 	}()
 
 	testFinished := false
 	for i := 0; i <= 15 && testFinished == false; i++ {
 		time.Sleep(1 * time.Second)
-		stdOut := ts.stdOut.String()
+		Stdout := ts.Stdout.String()
 
-		if !strings.Contains(stdOut, "Linger set; waiting for Ctrl+C") {
+		if !strings.Contains(Stdout, "Linger set; waiting for Ctrl+C") {
 			t.Logf("test wasn't finished on try %d at t=%s", i, time.Now())
 			continue
 		}
@@ -835,12 +862,12 @@ func TestAbortedByScriptSetupError(t *testing.T) {
 		export function handleSummary() { return {stdout: '\n\n\nbogus summary\n\n\n'};}
 	`)
 
-	doChecks := func(t *testing.T, ts *globalTestState) {
-		stdOut := ts.stdOut.String()
-		assert.Contains(t, stdOut, "Error: foo")
-		assert.Contains(t, stdOut, "wonky setup")
-		assert.NotContains(t, stdOut, "nice teardown") // do not execute teardown if setup failed
-		assert.Contains(t, stdOut, "bogus summary")
+	doChecks := func(t *testing.T, ts *state.GlobalTestState) {
+		Stdout := ts.Stdout.String()
+		assert.Contains(t, Stdout, "Error: foo")
+		assert.Contains(t, Stdout, "wonky setup")
+		assert.NotContains(t, Stdout, "nice teardown") // do not execute teardown if setup failed
+		assert.Contains(t, Stdout, "bogus summary")
 	}
 
 	t.Run("noLinger", func(t *testing.T) {
@@ -873,12 +900,12 @@ func TestAbortedByScriptTeardownError(t *testing.T) {
 		export function handleSummary() { return {stdout: '\n\n\nbogus summary\n\n\n'};}
 	`)
 
-	doChecks := func(t *testing.T, ts *globalTestState) {
-		stdOut := ts.stdOut.String()
-		assert.Contains(t, stdOut, "Error: foo")
-		assert.Contains(t, stdOut, "nice setup")
-		assert.Contains(t, stdOut, "wonky teardown")
-		assert.Contains(t, stdOut, "bogus summary")
+	doChecks := func(t *testing.T, ts *state.GlobalTestState) {
+		Stdout := ts.Stdout.String()
+		assert.Contains(t, Stdout, "Error: foo")
+		assert.Contains(t, Stdout, "nice setup")
+		assert.Contains(t, Stdout, "wonky teardown")
+		assert.Contains(t, Stdout, "bogus summary")
 	}
 
 	t.Run("noLinger", func(t *testing.T) {
@@ -894,18 +921,18 @@ func TestAbortedByScriptTeardownError(t *testing.T) {
 	})
 }
 
-func testAbortedByScriptError(t *testing.T, script []byte, runTest func(*testing.T, *globalTestState)) *globalTestState {
+func testAbortedByScriptError(t *testing.T, script []byte, runTest func(*testing.T, *state.GlobalTestState)) *state.GlobalTestState {
 	ts := getSimpleCloudOutputTestState(
 		t, script, nil, lib.RunStatusAbortedScriptError, cloudapi.ResultStatusPassed, int(exitcodes.ScriptException),
 	)
 	runTest(t, ts)
 
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
-	assert.Contains(t, stdOut, `level=debug msg="Metrics processing finished!"`)
-	assert.Contains(t, stdOut, `level=debug msg="Everything has finished, exiting k6!"`)
-	assert.Contains(t, stdOut, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=7 tainted=false`)
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
+	assert.Contains(t, Stdout, `level=debug msg="Metrics processing finished!"`)
+	assert.Contains(t, Stdout, `level=debug msg="Everything has finished, exiting k6!"`)
+	assert.Contains(t, Stdout, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=7 tainted=false`)
 	return ts
 }
 
@@ -920,16 +947,16 @@ func TestAbortedByTestAbortFirstInitCode(t *testing.T) {
 		export function handleSummary() { return {stdout: '\n\n\nbogus summary\n\n\n'};}
 	`)
 
-	ts := newGlobalTestState(t)
-	require.NoError(t, afero.WriteFile(ts.fs, filepath.Join(ts.cwd, "test.js"), script, 0o644))
-	ts.args = []string{"k6", "run", "-v", "--log-output=stdout", "test.js"}
-	ts.expectedExitCode = int(exitcodes.ScriptAborted)
+	ts := state.NewGlobalTestState(t)
+	require.NoError(t, afero.WriteFile(ts.FS, filepath.Join(ts.Cwd, "test.js"), script, 0o644))
+	ts.CmdArgs = []string{"k6", "run", "-v", "--log-output=stdout", "test.js"}
+	ts.ExpectedExitCode = int(exitcodes.ScriptAborted)
 
-	newRootCommand(ts.globalState).execute()
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, "test aborted: foo")
-	assert.NotContains(t, stdOut, "bogus summary")
+	cmd.Execute(ts.GlobalState)
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, "test aborted: foo")
+	assert.NotContains(t, Stdout, "bogus summary")
 }
 
 func TestAbortedByTestAbortInNonFirstInitCode(t *testing.T) {
@@ -955,21 +982,21 @@ func TestAbortedByTestAbortInNonFirstInitCode(t *testing.T) {
 	//   ts := testAbortedByScriptTestAbort(t, false, script, runTestWithNoLinger)
 	//
 	// See https://github.com/grafana/k6/issues/2790 for details. Right now we
-	// need the stdOut locking because VU initialization is not properly synchronized:
+	// need the Stdout locking because VU initialization is not properly synchronized:
 	// when a test is aborted during the init phase, some logs might be emitted
 	// after the root command returns...
 
 	ts := getSimpleCloudOutputTestState(
 		t, script, nil, lib.RunStatusAbortedUser, cloudapi.ResultStatusPassed, int(exitcodes.ScriptAborted),
 	)
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, "test aborted: foo")
-	assert.Contains(t, stdOut, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=5 tainted=false`)
-	assert.Contains(t, stdOut, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
-	assert.NotContains(t, stdOut, "bogus summary")
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, "test aborted: foo")
+	assert.Contains(t, Stdout, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=5 tainted=false`)
+	assert.Contains(t, Stdout, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
+	assert.NotContains(t, Stdout, "bogus summary")
 }
 
 func TestAbortedByScriptAbortInVUCode(t *testing.T) {
@@ -1038,23 +1065,24 @@ func TestAbortedByScriptAbortInTeardown(t *testing.T) {
 }
 
 func testAbortedByScriptTestAbort(
-	t *testing.T, shouldHaveMetrics bool, script []byte, runTest func(*testing.T, *globalTestState),
-) *globalTestState {
+	//nolint: unparam  // will be fixed by https://github.com/grafana/k6/pull/2800
+	t *testing.T, shouldHaveMetrics bool, script []byte, runTest func(*testing.T, *state.GlobalTestState),
+) *state.GlobalTestState {
 	ts := getSimpleCloudOutputTestState(
 		t, script, nil, lib.RunStatusAbortedUser, cloudapi.ResultStatusPassed, int(exitcodes.ScriptAborted),
 	)
 	runTest(t, ts)
 
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, "test aborted: foo")
-	assert.Contains(t, stdOut, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=5 tainted=false`)
-	assert.Contains(t, stdOut, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, "test aborted: foo")
+	assert.Contains(t, Stdout, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=5 tainted=false`)
+	assert.Contains(t, Stdout, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
 	if shouldHaveMetrics {
-		assert.Contains(t, stdOut, `level=debug msg="Metrics processing finished!"`)
-		assert.Contains(t, stdOut, "bogus summary")
+		assert.Contains(t, Stdout, `level=debug msg="Metrics processing finished!"`)
+		assert.Contains(t, Stdout, "bogus summary")
 	} else {
-		assert.NotContains(t, stdOut, "bogus summary")
+		assert.NotContains(t, Stdout, "bogus summary")
 	}
 	return ts
 }
@@ -1077,15 +1105,15 @@ func TestAbortedByScriptInitError(t *testing.T) {
 	ts := getSimpleCloudOutputTestState(
 		t, script, nil, lib.RunStatusAbortedScriptError, cloudapi.ResultStatusPassed, int(exitcodes.ScriptException),
 	)
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	stdOut := ts.stdOut.String()
+	Stdout := ts.Stdout.String()
 
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, `level=error msg="Error: oops in 2\n\tat file:///`)
-	assert.Contains(t, stdOut, `hint="error while initializing VU #2 (script exception)"`)
-	assert.Contains(t, stdOut, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
-	assert.Contains(t, stdOut, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=7 tainted=false`)
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, `level=error msg="Error: oops in 2\n\tat file:///`)
+	assert.Contains(t, Stdout, `hint="error while initializing VU #2 (script exception)"`)
+	assert.Contains(t, Stdout, `level=debug msg="Metrics emission of VUs and VUsMax metrics stopped"`)
+	assert.Contains(t, Stdout, `level=debug msg="Sending test finished" output=cloud ref=111 run_status=7 tainted=false`)
 }
 
 func TestMetricTagAndSetupDataIsolation(t *testing.T) {
@@ -1176,11 +1204,11 @@ func TestMetricTagAndSetupDataIsolation(t *testing.T) {
 		t, script, []string{"--quiet", "--log-output", "stdout"},
 		lib.RunStatusFinished, cloudapi.ResultStatusPassed, 0,
 	)
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Equal(t, 12, strings.Count(stdOut, "✓"))
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Equal(t, 12, strings.Count(Stdout, "✓"))
 }
 
 func getSampleValues(t *testing.T, jsonOutput []byte, metric string, tags map[string]string) []float64 {
@@ -1298,22 +1326,22 @@ func TestActiveVUsCount(t *testing.T) {
 		}
 	`)
 
-	ts := newGlobalTestState(t)
-	require.NoError(t, afero.WriteFile(ts.fs, filepath.Join(ts.cwd, "test.js"), script, 0o644))
-	ts.args = []string{"k6", "run", "--compatibility-mode", "base", "--out", "json=results.json", "test.js"}
-	newRootCommand(ts.globalState).execute()
+	ts := state.NewGlobalTestState(t)
+	require.NoError(t, afero.WriteFile(ts.FS, filepath.Join(ts.Cwd, "test.js"), script, 0o644))
+	ts.CmdArgs = []string{"k6", "run", "--compatibility-mode", "base", "--out", "json=results.json", "test.js"}
+	cmd.Execute(ts.GlobalState)
 
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
 
-	jsonResults, err := afero.ReadFile(ts.fs, "results.json")
+	jsonResults, err := afero.ReadFile(ts.FS, "results.json")
 	require.NoError(t, err)
 	// t.Log(string(jsonResults))
 	assert.Equal(t, float64(10), max(getSampleValues(t, jsonResults, "vus_max", nil)))
 	assert.Equal(t, float64(10), max(getSampleValues(t, jsonResults, "vus", nil)))
 	assert.Equal(t, float64(0), sum(getSampleValues(t, jsonResults, "iterations", nil)))
 
-	logEntries := ts.loggerHook.Drain()
+	logEntries := ts.LoggerHook.Drain()
 	assert.Len(t, logEntries, 4)
 	for i, logEntry := range logEntries {
 		assert.Equal(t, logrus.WarnLevel, logEntry.Level)
@@ -1349,7 +1377,7 @@ func TestMinIterationDuration(t *testing.T) {
 	ts := getSimpleCloudOutputTestState(t, script, nil, lib.RunStatusFinished, cloudapi.ResultStatusPassed, 0)
 
 	start := time.Now()
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 	elapsed := time.Since(start)
 	assert.Greater(t, elapsed, 5*time.Second, "expected more time to have passed because of minIterationDuration")
 	assert.Less(
@@ -1357,9 +1385,9 @@ func TestMinIterationDuration(t *testing.T) {
 		"expected less time to have passed because minIterationDuration should not affect setup() and teardown() ",
 	)
 
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
-	assert.Contains(t, stdOut, "✓ test_counter.........: 3")
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
+	assert.Contains(t, Stdout, "✓ test_counter.........: 3")
 }
 
 func TestRunTags(t *testing.T) {
@@ -1423,20 +1451,20 @@ func TestRunTags(t *testing.T) {
 		}
 	`))
 
-	ts := newGlobalTestState(t)
-	require.NoError(t, afero.WriteFile(ts.fs, filepath.Join(ts.cwd, "test.js"), script, 0o644))
-	ts.args = []string{
+	ts := state.NewGlobalTestState(t)
+	require.NoError(t, afero.WriteFile(ts.FS, filepath.Join(ts.Cwd, "test.js"), script, 0o644))
+	ts.CmdArgs = []string{
 		"k6", "run", "-u", "2", "--tag", "foo=bar", "--tag", "test=mest", "--tag", "over=written",
 		"--log-output=stdout", "--out", "json=results.json", "test.js",
 	}
-	ts.envVars["K6_ITERATIONS"] = "3"
-	ts.envVars["K6_INSECURE_SKIP_TLS_VERIFY"] = "true"
-	newRootCommand(ts.globalState).execute()
+	ts.Env["K6_ITERATIONS"] = "3"
+	ts.Env["K6_INSECURE_SKIP_TLS_VERIFY"] = "true"
+	cmd.Execute(ts.GlobalState)
 
-	stdOut := ts.stdOut.String()
-	t.Log(stdOut)
+	Stdout := ts.Stdout.String()
+	t.Log(Stdout)
 
-	jsonResults, err := afero.ReadFile(ts.fs, "results.json")
+	jsonResults, err := afero.ReadFile(ts.FS, "results.json")
 	require.NoError(t, err)
 
 	expTags := map[string]string{"foo": "bar", "test": "mest", "over": "written", "scenario": "default"}
@@ -1475,15 +1503,15 @@ func TestRunTags(t *testing.T) {
 func TestPrometheusRemoteWriteOutput(t *testing.T) {
 	t.Parallel()
 
-	ts := newGlobalTestState(t)
-	ts.args = []string{"k6", "run", "--out", "experimental-prometheus-rw", "-"}
-	ts.console.Stdin = &testOSFileR{bytes.NewBufferString(`
+	ts := state.NewGlobalTestState(t)
+	ts.CmdArgs = []string{"k6", "run", "--out", "experimental-prometheus-rw", "-"}
+	ts.Console.Stdin = &state.TestOSFileR{Reader: bytes.NewBufferString(`
 		import exec from 'k6/execution';
 		export default function () {};
 	`)}
 
-	newRootCommand(ts.globalState).execute()
+	cmd.Execute(ts.GlobalState)
 
-	stdOut := ts.stdOut.String()
-	assert.Contains(t, stdOut, "output: Prometheus remote write")
+	Stdout := ts.Stdout.String()
+	assert.Contains(t, Stdout, "output: Prometheus remote write")
 }
