@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"go.k6.io/k6/cloudapi"
+	"go.k6.io/k6/cmd/state"
 	"go.k6.io/k6/errext"
 	"go.k6.io/k6/errext/exitcodes"
 	"go.k6.io/k6/lib"
@@ -25,7 +26,7 @@ import (
 
 // cmdCloud handles the `k6 cloud` sub-command
 type cmdCloud struct {
-	gs *globalState
+	gs *state.GlobalState
 
 	showCloudLogs bool
 	exitOnRunning bool
@@ -37,7 +38,7 @@ func (c *cmdCloud) preRun(cmd *cobra.Command, args []string) error {
 	// We deliberately parse the env variables, to validate for wrong
 	// values, even if we don't subsequently use them (if the respective
 	// CLI flag was specified, since it has a higher priority).
-	if showCloudLogsEnv, ok := c.gs.envVars["K6_SHOW_CLOUD_LOGS"]; ok {
+	if showCloudLogsEnv, ok := c.gs.Env["K6_SHOW_CLOUD_LOGS"]; ok {
 		showCloudLogsValue, err := strconv.ParseBool(showCloudLogsEnv)
 		if err != nil {
 			return fmt.Errorf("parsing K6_SHOW_CLOUD_LOGS returned an error: %w", err)
@@ -47,7 +48,7 @@ func (c *cmdCloud) preRun(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if exitOnRunningEnv, ok := c.gs.envVars["K6_EXIT_ON_RUNNING"]; ok {
+	if exitOnRunningEnv, ok := c.gs.Env["K6_EXIT_ON_RUNNING"]; ok {
 		exitOnRunningValue, err := strconv.ParseBool(exitOnRunningEnv)
 		if err != nil {
 			return fmt.Errorf("parsing K6_EXIT_ON_RUNNING returned an error: %w", err)
@@ -112,7 +113,7 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 
 	// Cloud config
 	cloudConfig, err := cloudapi.GetConsolidatedConfig(
-		test.derivedConfig.Collectors["cloud"], c.gs.envVars, "", arc.Options.External)
+		test.derivedConfig.Collectors["cloud"], c.gs.Env, "", arc.Options.External)
 	if err != nil {
 		return err
 	}
@@ -146,10 +147,10 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 		name = filepath.Base(test.sourceRootPath)
 	}
 
-	globalCtx, globalCancel := context.WithCancel(c.gs.ctx)
+	globalCtx, globalCancel := context.WithCancel(c.gs.Ctx)
 	defer globalCancel()
 
-	logger := c.gs.logger
+	logger := c.gs.Logger
 
 	// Start cloud test run
 	progressBar.Modify(pb.WithConstProgress(0, "Validating script options"))
@@ -196,13 +197,13 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 	executionPlan := test.derivedConfig.Scenarios.GetFullExecutionRequirements(et)
 
 	execDesc := getExecutionDescription(
-		c.gs.console.ApplyTheme, "cloud", test.sourceRootPath, testURL, test.derivedConfig,
+		c.gs.Console.ApplyTheme, "cloud", test.sourceRootPath, testURL, test.derivedConfig,
 		et, executionPlan, nil,
 	)
-	if c.gs.flags.quiet {
-		c.gs.logger.Debug(execDesc)
+	if c.gs.Flags.Quiet {
+		c.gs.Logger.Debug(execDesc)
 	} else {
-		c.gs.console.Print(execDesc)
+		c.gs.Console.Print(execDesc)
 	}
 
 	progressBar.Modify(
@@ -213,12 +214,12 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 
 	progressCtx, progressCancel := context.WithCancel(globalCtx)
 	defer progressCancel()
-	if !c.gs.flags.quiet {
+	if !c.gs.Flags.Quiet {
 		progressBarWG := &sync.WaitGroup{}
 		progressBarWG.Add(1)
 		defer progressBarWG.Wait()
 		go func() {
-			c.gs.console.ShowProgress(progressCtx, []*pb.ProgressBar{progressBar})
+			c.gs.Console.ShowProgress(progressCtx, []*pb.ProgressBar{progressBar})
 			progressBarWG.Done()
 		}()
 	}
@@ -293,9 +294,9 @@ func (c *cmdCloud) run(cmd *cobra.Command, args []string) error {
 		return errext.WithExitCodeIfNone(errors.New("Test progress error"), exitcodes.CloudFailedToGetProgress)
 	}
 
-	if !c.gs.flags.quiet {
-		c.gs.console.Printf("     test status: %s\n",
-			c.gs.console.ApplyTheme(testProgress.RunStatusText))
+	if !c.gs.Flags.Quiet {
+		c.gs.Console.Printf("     test status: %s\n",
+			c.gs.Console.ApplyTheme(testProgress.RunStatusText))
 	} else {
 		logger.WithField("run_status", testProgress.RunStatusText).Debug("Test finished")
 	}
@@ -324,7 +325,7 @@ func (c *cmdCloud) flagSet() *pflag.FlagSet {
 	return flags
 }
 
-func getCmdCloud(gs *globalState) *cobra.Command {
+func getCmdCloud(gs *state.GlobalState) *cobra.Command {
 	c := &cmdCloud{
 		gs:            gs,
 		showCloudLogs: true,

@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"go.k6.io/k6/api"
+	"go.k6.io/k6/cmd/state"
 	"go.k6.io/k6/core"
 	"go.k6.io/k6/core/local"
 	"go.k6.io/k6/errext"
@@ -30,7 +31,7 @@ import (
 
 // cmdRun handles the `k6 run` sub-command
 type cmdRun struct {
-	gs *globalState
+	gs *state.GlobalState
 }
 
 // TODO: split apart some more
@@ -61,7 +62,7 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) error {
 	//  - The globalCtx is cancelled only after we're completely done with the
 	//    test execution and any --linger has been cleared, so that the Engine
 	//    can start winding down its metrics processing.
-	globalCtx, globalCancel := context.WithCancel(c.gs.ctx)
+	globalCtx, globalCancel := context.WithCancel(c.gs.Ctx)
 	defer globalCancel()
 	lingerCtx, lingerCancel := context.WithCancel(globalCtx)
 	defer lingerCancel()
@@ -80,7 +81,7 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) error {
 	progressCtx, progressCancel := context.WithCancel(globalCtx)
 	defer progressCancel()
 	progressBarWG := &sync.WaitGroup{}
-	if !c.gs.flags.quiet {
+	if !c.gs.Flags.Quiet {
 		progressBarWG.Add(1)
 
 		// This is manually triggered after the Engine's Run() has completed,
@@ -93,7 +94,7 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) error {
 			for _, s := range execScheduler.GetExecutors() {
 				pbs = append(pbs, s.GetProgress())
 			}
-			c.gs.console.ShowProgress(progressCtx, pbs)
+			c.gs.Console.ShowProgress(progressCtx, pbs)
 		}()
 	}
 
@@ -116,16 +117,16 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) error {
 	}
 
 	// Spin up the REST API server, if not disabled.
-	if c.gs.flags.address != "" {
+	if c.gs.Flags.Address != "" {
 		initBar.Modify(pb.WithConstProgress(0, "Init API server"))
 		go func() {
-			logger.Debugf("Starting the REST API server on %s", c.gs.flags.address)
+			logger.Debugf("Starting the REST API server on %s", c.gs.Flags.Address)
 			// TODO: send the ExecutionState and MetricsEngine instead of the Engine
-			if aerr := api.ListenAndServe(c.gs.flags.address, engine, logger); aerr != nil {
+			if aerr := api.ListenAndServe(c.gs.Flags.Address, engine, logger); aerr != nil {
 				// Only exit k6 if the user has explicitly set the REST API address
 				if cmd.Flags().Lookup("address").Changed {
 					logger.WithError(aerr).Error("Error from API server")
-					c.gs.osExit(int(exitcodes.CannotStartRESTAPI))
+					c.gs.OSExit(int(exitcodes.CannotStartRESTAPI))
 				} else {
 					logger.WithError(aerr).Warn("Error from API server")
 				}
@@ -143,13 +144,13 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) error {
 	defer engine.OutputManager.StopOutputs()
 
 	execDesc := getExecutionDescription(
-		c.gs.console.ApplyTheme, "local", args[0], "", conf,
+		c.gs.Console.ApplyTheme, "local", args[0], "", conf,
 		execScheduler.GetState().ExecutionTuple, executionPlan, outputs,
 	)
-	if c.gs.flags.quiet {
-		c.gs.logger.Debug(execDesc)
+	if c.gs.Flags.Quiet {
+		c.gs.Logger.Debug(execDesc)
 	} else {
-		c.gs.console.Print(execDesc)
+		c.gs.Console.Print(execDesc)
 	}
 
 	// Trap Interrupts, SIGINTs and SIGTERMs.
@@ -216,15 +217,15 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) error {
 			Metrics:         engine.MetricsEngine.ObservedMetrics,
 			RootGroup:       execScheduler.GetRunner().GetDefaultGroup(),
 			TestRunDuration: executionState.GetCurrentTestRunDuration(),
-			NoColor:         c.gs.flags.noColor,
+			NoColor:         c.gs.Flags.NoColor,
 			UIState: lib.UIState{
-				IsStdOutTTY: c.gs.console.IsTTY,
-				IsStdErrTTY: c.gs.console.IsTTY,
+				IsStdOutTTY: c.gs.Console.IsTTY,
+				IsStdErrTTY: c.gs.Console.IsTTY,
 			},
 		})
 		engine.MetricsEngine.MetricsLock.Unlock()
 		if hsErr == nil {
-			hsErr = handleSummaryResult(c.gs.fs, c.gs.console.Stdout, c.gs.console.Stderr, summaryResult)
+			hsErr = handleSummaryResult(c.gs.FS, c.gs.Console.Stdout, c.gs.Console.Stderr, summaryResult)
 		}
 		if hsErr != nil {
 			logger.WithError(hsErr).Error("failed to handle the end-of-test summary")
@@ -237,8 +238,8 @@ func (c *cmdRun) run(cmd *cobra.Command, args []string) error {
 			// do nothing, we were interrupted by Ctrl+C already
 		default:
 			logger.Debug("Linger set; waiting for Ctrl+C...")
-			if !c.gs.flags.quiet {
-				c.gs.console.Print("Linger set; waiting for Ctrl+C...")
+			if !c.gs.Flags.Quiet {
+				c.gs.Console.Printf("Linger set; waiting for Ctrl+C...")
 			}
 			<-lingerCtx.Done()
 			logger.Debug("Ctrl+C received, exiting...")
@@ -271,7 +272,7 @@ func (c *cmdRun) flagSet() *pflag.FlagSet {
 	return flags
 }
 
-func getCmdRun(gs *globalState) *cobra.Command {
+func getCmdRun(gs *state.GlobalState) *cobra.Command {
 	c := &cmdRun{
 		gs: gs,
 	}

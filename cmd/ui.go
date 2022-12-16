@@ -1,15 +1,18 @@
 package cmd
 
-import "go.k6.io/k6/ui/console/pb"
+import (
+	"go.k6.io/k6/cmd/state"
+	"go.k6.io/k6/ui/console/pb"
+)
 
-func maybePrintBanner(gs *globalState) {
-	if !gs.flags.quiet {
-		gs.console.Printf("\n%s\n\n", gs.console.Banner())
+func maybePrintBanner(gs *state.GlobalState) {
+	if !gs.Flags.Quiet {
+		gs.Console.Printf("\n%s\n\n", gs.Console.Banner())
 	}
 }
 
-func maybePrintBar(gs *globalState, bar *pb.ProgressBar) {
-	if !gs.flags.quiet {
-		gs.console.PrintBar(bar)
+func maybePrintBar(gs *state.GlobalState, bar *pb.ProgressBar) {
+	if !gs.Flags.Quiet {
+		gs.Console.PrintBar(bar)
 	}
 }
