@@ -19,6 +19,15 @@ var (
 	resultAwaitMarker = NewSymbol("await")
 )
 
+// AsyncContextTracker is a handler that allows to track async function's execution context. Every time an async
+// function is suspended on 'await', Suspended() is called. The trackingObject it returns is remembered and
+// the next time just before the context is resumed, Resumed is called with the same trackingObject as argument.
+// To register it call Runtime.SetAsyncContextTracker().
+type AsyncContextTracker interface {
+	Suspended() (trackingObject interface{})
+	Resumed(trackingObject interface{})
+}
+
 type funcObjectImpl interface {
 	source() valueString
 }
@@ -597,10 +606,18 @@ type asyncRunner struct {
 	f          *Object
 	vmCall     func(*vm, int)
 
-	onFulfilledFunc, onRejectedFunc Value
+	trackingObj interface{}
 }
 
 func (ar *asyncRunner) onFulfilled(call FunctionCall) Value {
+	if tracker := ar.f.runtime.asyncContextTracker; tracker != nil {
+		tracker.Resumed(ar.trackingObj)
+		ar.trackingObj = nil
+	}
+	ar.gen.vm.curAsyncRunner = ar
+	defer func() {
+		ar.gen.vm.curAsyncRunner = nil
+	}()
 	arg := call.Argument(0)
 	res, resType, ex := ar.gen.next(arg)
 	ar.step(res, resType == resultNormal, ex)
@@ -608,24 +625,18 @@ func (ar *asyncRunner) onFulfilled(call FunctionCall) Value {
 }
 
 func (ar *asyncRunner) onRejected(call FunctionCall) Value {
+	if tracker := ar.f.runtime.asyncContextTracker; tracker != nil {
+		tracker.Resumed(ar.trackingObj)
+		ar.trackingObj = nil
+	}
+	ar.gen.vm.curAsyncRunner = ar
+	defer func() {
+		ar.gen.vm.curAsyncRunner = nil
+	}()
 	reason := call.Argument(0)
 	res, resType, ex := ar.gen.nextThrow(reason)
 	ar.step(res, resType == resultNormal, ex)
 	return _undefined
-}
-
-func (ar *asyncRunner) getOnFulfilledFunc() Value {
-	if ar.onFulfilledFunc == nil {
-		ar.onFulfilledFunc = ar.f.runtime.newNativeFunc(ar.onFulfilled, nil, "", nil, 1)
-	}
-	return ar.onFulfilledFunc
-}
-
-func (ar *asyncRunner) getOnRejectedFunc() Value {
-	if ar.onRejectedFunc == nil {
-		ar.onRejectedFunc = ar.f.runtime.newNativeFunc(ar.onRejected, nil, "", nil, 1)
-	}
-	return ar.onRejectedFunc
 }
 
 func (ar *asyncRunner) step(res Value, done bool, ex *Exception) {
@@ -638,8 +649,19 @@ func (ar *asyncRunner) step(res Value, done bool, ex *Exception) {
 	} else {
 		// await
 		r := ar.f.runtime
+		if tracker := r.asyncContextTracker; tracker != nil {
+			ar.trackingObj = tracker.Suspended()
+		}
 		promise := r.promiseResolve(r.global.Promise, res)
-		r.performPromiseThen(promise.self.(*Promise), ar.getOnFulfilledFunc(), ar.getOnRejectedFunc(), nil)
+		promise.self.(*Promise).addReactions(&promiseReaction{
+			typ:         promiseReactionFulfill,
+			handler:     &jobCallback{callback: ar.onFulfilled},
+			asyncRunner: ar,
+		}, &promiseReaction{
+			typ:         promiseReactionReject,
+			handler:     &jobCallback{callback: ar.onRejected},
+			asyncRunner: ar,
+		})
 	}
 }
 
